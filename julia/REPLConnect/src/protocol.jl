@@ -1,0 +1,426 @@
+# Protocol reference: TidierOrg/positron-julia's variables service and
+# wurli/jet.ark's resources/positron-comms/variables*-openrpc.json.
+# This transport-free dictionary implementation differs from Positron's
+# generated request types; see ../../../docs/attribution.md.
+#
+# The `positron.variables` JSON-RPC protocol, independent of the transport.
+#
+# Requests are `Dict`s as decoded from a comm message
+# (`{"jsonrpc": "2.0", "id": ..., "method": ..., "params": ...}`); `respond`
+# turns one into the reply message. Events (`refresh`, `update`) are built by
+# `refresh!` and `update!`.
+
+const METHOD_NOT_FOUND = -32601
+const INVALID_PARAMS = -32602
+const INTERNAL_ERROR = -32603
+
+"A JSON-RPC error, sent to the client as an `error` reply."
+struct RpcError <: Exception
+    code::Int
+    message::String
+end
+
+"""
+State of one open variables comm: the module being inspected, a version
+counter (bumped whenever the client is told something changed) and the
+snapshot the client last saw.
+"""
+mutable struct Service
+    comm_id::String
+    mod::Module
+    version::Int
+    snapshot::Dict{String, Any}
+end
+"Construct a comm service with version zero and an empty snapshot."
+Service(comm_id::AbstractString, mod::Module = Main) = Service(
+    String(comm_id),
+    mod,
+    0,
+    Dict{String, Any}(),
+)
+
+#
+# Messages
+#
+
+"Build a JSON-RPC success reply, preserving the request id and result."
+result_message(id, result) = Dict{String, Any}(
+    "jsonrpc" => "2.0",
+    "id" => id,
+    "result" => result,
+)
+
+"Build a JSON-RPC error reply from an `RpcError`."
+function error_message(id, err::RpcError)
+    return Dict{String, Any}(
+        "jsonrpc" => "2.0",
+        "id" => id,
+        "error" => Dict{String, Any}("code" => err.code, "message" => err.message),
+    )
+end
+
+"Build a JSON-RPC notification (no request id) carrying event parameters."
+event_message(name::AbstractString, params) = Dict{String, Any}(
+    "jsonrpc" => "2.0",
+    "method" => String(name),
+    "params" => params,
+)
+
+#
+# Events
+#
+
+"Describe every variable and remember the snapshot; the result of `list` and the `refresh` event."
+function refresh!(service::Service)
+    variables = collect_variables(service.mod)
+    service.version = version()
+    service.snapshot = snapshot(service.mod)
+    return Dict{String, Any}(
+        "variables" => variables,
+        "length" => length(variables),
+        "version" => service.version,
+    )
+end
+
+"Parameters of an `update` event, or `nothing` if nothing changed since the last snapshot."
+function update!(service::Service)
+    current = snapshot(service.mod)
+    changed, removed = diff(service.snapshot, current)
+    isempty(changed) && isempty(removed) && return nothing
+
+    time = now_ms()
+    assigned = Dict{String, Any}[]
+    for name in changed
+        try
+            push!(assigned, variable(name, getglobal(service.mod, Symbol(name)); time))
+        catch
+            # The variable disappeared or cannot be inspected; the next update fixes it.
+        end
+    end
+
+    service.version = version()
+    service.snapshot = current
+    return Dict{String, Any}(
+        "assigned" => assigned,
+        "removed" => removed,
+        "version" => service.version,
+    )
+end
+
+"""
+Result of `changes`: what differs from the snapshot the client saw at version
+`since`. A client that is not at the service's last version cannot be diffed
+and is told to `refresh`.
+"""
+function changes!(service::Service, since)
+    current = version()
+    since == current && return Dict{String, Any}("version" => current)
+    since == service.version ||
+        return Dict{String, Any}("version" => current, "refresh" => true)
+    update = update!(service)
+    if update === nothing
+        service.version = current
+        return Dict{String, Any}("version" => current)
+    end
+    return update
+end
+
+#
+# Requests
+#
+
+"Read a dictionary parameter, or use `default` for absent/non-dictionary parameters."
+param(params, key::AbstractString, default = nothing) = params isa AbstractDict ?
+    get(params, key, default) :
+    default
+
+"Require a vector `path` and stringify its keys; empty paths are rejected later by `resolve`."
+function path_param(params)
+    path = param(params, "path")
+    path isa AbstractVector || throw(RpcError(INVALID_PARAMS, "Missing `path`"))
+    return String[string(k) for k in path]
+end
+
+"Delete a visible binding and return success; require `Base.delete_binding`, otherwise RPC method-not-found."
+function delete_global!(mod::Module, name::AbstractString)
+    isdefined(Base, :delete_binding) ||
+        throw(RpcError(METHOD_NOT_FOUND, "Deleting variables needs Base.delete_binding"))
+    sym = Symbol(name)
+    is_visible(mod, sym) || return false
+    Base.delete_binding(mod, sym)
+    return true
+end
+
+"Unlimited MIME display for copying: HTML when requested and showable, otherwise plain text."
+function clipboard_text(value, format::AbstractString)
+    mime = format == "text/html" && showable(MIME("text/html"), value) ?
+        MIME("text/html") :
+        MIME("text/plain")
+    io = IOBuffer()
+    show(IOContext(io, :limit => false), mime, value)
+    return String(take!(io))
+end
+
+"""
+    handle_request(service, Val(method), params)
+
+Dispatch a decoded RPC method, returning its result or throwing an error.
+`list` refreshes state; `inspect` and `clipboard_format` resolve access paths;
+`delete` returns deleted names and `clear` deletes visible bindings only
+(`include_hidden_objects` is currently ignored). Positron's `view` and
+`query_table_summary` are unsupported; REPLConnect adds `viewer_page` and
+`table_page` in `viewer.jl`. Unknown methods throw `METHOD_NOT_FOUND`.
+The transport sends updates after mutating requests; this function does not.
+"""
+handle_request(::Service, ::Val{M}, params) where {M} = throw(RpcError(
+    METHOD_NOT_FOUND,
+    "Unknown method: $M",
+))
+
+handle_request(service::Service, ::Val{:list}, params) = refresh!(service)
+
+const PROTOCOL_VERSION = 1
+
+"Features this session offers; `history` only while inputs are recorded."
+function capabilities()
+    features = ["variables", "viewer", "mutations", "complete", "shutdown", "definition"]
+    RECORD_HISTORY[] && push!(features, "history")
+    capturing_plots() && push!(features, "plots")
+    return features
+end
+const STARTED_AT = Ref(0)
+
+function handle_request(::Service, ::Val{:initialize}, params)
+    return Dict{String, Any}(
+        "protocol_version" => PROTOCOL_VERSION,
+        "language" => "julia",
+        "language_version" => string(VERSION),
+        "pid" => getpid(),
+        "started_at" => STARTED_AT[],
+        "capabilities" => capabilities(),
+    )
+end
+
+handle_request(::Service, ::Val{:status}, params) = Dict{String, Any}(
+    "version" => version(),
+    "busy" => busy(),
+)
+
+function handle_request(service::Service, ::Val{:changes}, params)
+    since = param(params, "since")
+    since isa Integer || throw(RpcError(INVALID_PARAMS, "Missing `since`"))
+    return changes!(service, since)
+end
+
+function handle_request(service::Service, ::Val{:inspect}, params)
+    children, total = inspect(resolve(path_param(params), service.mod))
+    return Dict{String, Any}("children" => children, "length" => total)
+end
+
+function handle_request(service::Service, ::Val{:clipboard_format}, params)
+    value = resolve(path_param(params), service.mod)
+    return Dict{String, Any}("content" => clipboard_text(
+        value,
+        param(params, "format", "text/plain"),
+    ))
+end
+
+const BUSY = -32001
+
+"Refuse a mutation while the REPL is evaluating."
+function require_idle()
+    busy() && throw(RpcError(BUSY, "The REPL is evaluating"))
+    return nothing
+end
+
+function handle_request(service::Service, ::Val{:delete}, params)
+    require_idle()
+    mark_dirty!()
+    names = param(params, "names", String[])
+    return String[string(n) for n in names if delete_global!(service.mod, string(n))]
+end
+
+function handle_request(service::Service, ::Val{:clear}, params)
+    require_idle()
+    mark_dirty!()
+    for name in visible_names(service.mod)
+        delete_global!(service.mod, String(name))
+    end
+    return nothing
+end
+
+handle_request(::Service, ::Val{:view}, params) = throw(RpcError(
+    METHOD_NOT_FOUND,
+    "Viewing variables is not supported",
+))
+
+handle_request(::Service, ::Val{:query_table_summary}, params) = throw(RpcError(
+    METHOD_NOT_FOUND,
+    "Table summaries are not supported",
+))
+
+"Methods after which the client must be told about removed variables."
+const MUTATING_METHODS = ("clear", "delete")
+
+"Preserve RPC errors, map lookup/argument errors to invalid-params, and bound other error messages."
+function rpc_error(e)
+    e isa RpcError && return e
+    e isa KeyError && return RpcError(INVALID_PARAMS, "Variable not found: $(e.key)")
+    e isa ArgumentError && return RpcError(INVALID_PARAMS, e.msg)
+    return RpcError(INTERNAL_ERROR, ellipsize(sprint(showerror, e), 500))
+end
+
+"Handle a dictionary request and convert dispatch errors to JSON-RPC replies, preserving its id."
+function respond(service::Service, request::AbstractDict)
+    id = get(request, "id", nothing)
+    try
+        method = get(request, "method", nothing)
+        method isa AbstractString || throw(RpcError(INVALID_PARAMS, "Missing `method`"))
+        return result_message(
+            id,
+            handle_request(service, Val(Symbol(method)), get(request, "params", nothing)),
+        )
+    catch e
+        return error_message(id, rpc_error(e))
+    end
+end
+
+@testitem "list replies with the visible variables" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(x = 1))
+    Core.eval(sandbox, :(xs = [1, 2]))
+    service = REPLConnect.Service("c", sandbox)
+
+    reply = REPLConnect.respond(service, Dict("id" => 5, "method" => "list"))
+    @test reply["jsonrpc"] == "2.0"
+    @test reply["id"] == 5
+    result = reply["result"]
+    @test [v["access_key"] for v in result["variables"]] == ["x", "xs"]
+    @test result["length"] == 2
+    @test result["version"] == REPLConnect.version()
+    @test service.version == REPLConnect.version()
+end
+
+@testitem "inspect returns children and their total" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(nt = (a = 1, b = [1, 2, 3])))
+    service = REPLConnect.Service("c", sandbox)
+
+    reply = REPLConnect.respond(
+        service,
+        Dict("id" => 1, "method" => "inspect", "params" => Dict("path" => ["nt"])),
+    )
+    @test [v["access_key"] for v in reply["result"]["children"]] == ["a", "b"]
+    @test reply["result"]["length"] == 2
+
+    reply = REPLConnect.respond(
+        service,
+        Dict("id" => 2, "method" => "inspect", "params" => Dict("path" => ["nt", "b"])),
+    )
+    @test [v["access_key"] for v in reply["result"]["children"]] == ["[1]", "[2]", "[3]"]
+end
+
+@testitem "inspect of a missing variable is an invalid-params error" begin
+    sandbox = Module(:Sandbox, false)
+    service = REPLConnect.Service("c", sandbox)
+
+    reply = REPLConnect.respond(
+        service,
+        Dict("id" => 1, "method" => "inspect", "params" => Dict("path" => ["nope"])),
+    )
+    @test !haskey(reply, "result")
+    @test reply["id"] == 1
+    @test reply["error"]["code"] == REPLConnect.INVALID_PARAMS
+
+    reply = REPLConnect.respond(
+        service,
+        Dict("id" => 2, "method" => "inspect", "params" => Dict()),
+    )
+    @test reply["error"]["code"] == REPLConnect.INVALID_PARAMS
+end
+
+@testitem "clipboard_format renders the full value" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(xs = $(collect(1:3))))
+    service = REPLConnect.Service("c", sandbox)
+
+    request = Dict(
+        "id" => 1,
+        "method" => "clipboard_format",
+        "params" => Dict("path" => ["xs"], "format" => "text/plain"),
+    )
+    content = REPLConnect.respond(service, request)["result"]["content"]
+    @test occursin("1", content) && occursin("3", content)
+end
+
+@testitem "unknown and unsupported methods are method-not-found errors" begin
+    service = REPLConnect.Service("c", Module(:Sandbox, false))
+    for method in ("bogus", "view", "query_table_summary")
+        reply = REPLConnect.respond(
+            service,
+            Dict("id" => 1, "method" => method, "params" => Dict("path" => ["x"])),
+        )
+        @test reply["error"]["code"] == REPLConnect.METHOD_NOT_FOUND
+    end
+    @test REPLConnect.respond(service, Dict("id" => 1))["error"]["code"] ==
+        REPLConnect.INVALID_PARAMS
+end
+
+@testitem "delete and clear remove globals" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(a = 1))
+    Core.eval(sandbox, :(b = 2))
+    Core.eval(sandbox, :(c = 3))
+    service = REPLConnect.Service("c", sandbox)
+
+    reply = REPLConnect.respond(
+        service,
+        Dict(
+            "id" => 1,
+            "method" => "delete",
+            "params" => Dict("names" => ["a", "missing"]),
+        ),
+    )
+    @test reply["result"] == ["a"]
+    @test REPLConnect.visible_names(sandbox) == [:b, :c]
+
+    reply = REPLConnect.respond(
+        service,
+        Dict(
+            "id" => 2,
+            "method" => "clear",
+            "params" => Dict("include_hidden_objects" => false),
+        ),
+    )
+    @test haskey(reply, "result") && reply["result"] === nothing
+    @test isempty(REPLConnect.visible_names(sandbox))
+end
+
+@testitem "update! reports changes, then nothing" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(a = 1))
+    service = REPLConnect.Service("c", sandbox)
+    refresh = REPLConnect.refresh!(service)
+    @test refresh["version"] == REPLConnect.version()
+    @test REPLConnect.update!(service) === nothing
+
+    Core.eval(sandbox, :(a = 2))
+    Core.eval(sandbox, :(b = "new"))
+    update = REPLConnect.update!(service)
+    @test sort!([v["access_key"] for v in update["assigned"]]) == ["a", "b"]
+    @test update["removed"] == String[]
+    @test update["version"] == REPLConnect.version()
+
+    Base.delete_binding(sandbox, :a)
+    update = REPLConnect.update!(service)
+    @test update["assigned"] == []
+    @test update["removed"] == ["a"]
+    @test REPLConnect.update!(service) === nothing
+end
+
+@testitem "event messages have the JSON-RPC notification shape" begin
+    msg = REPLConnect.event_message("update", Dict("version" => 3))
+    @test msg ==
+        Dict("jsonrpc" => "2.0", "method" => "update", "params" => Dict("version" => 3))
+    @test !haskey(msg, "id")
+end

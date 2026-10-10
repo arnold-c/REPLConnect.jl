@@ -1,0 +1,658 @@
+# Portions adapted from TidierOrg/positron-julia, julia/Positron/src/variables.jl:
+# https://github.com/TidierOrg/positron-julia/blob/main/julia/Positron/src/variables.jl
+# Copyright (C) 2025 Posit Software, PBC. All rights reserved.
+# Licensed under the Elastic License 2.0; see ../../../LICENSES/Elastic-2.0.txt.
+# Modified for REPLConnect: dictionary wire values, optional Tables.jl discovery,
+# bounded Unicode-safe displays, module-scoped lookup and snapshot diffs.
+# See ../../../docs/attribution.md for the scope of this adaptation.
+#
+# The variables model: what the `positron.variables` comm says about globals.
+#
+# Everything here is plain Julia with no dependencies. Extend the
+# per-type behaviour by adding methods to `kind`, `display_value`,
+# `display_type`, `n_children`, `children`, `child` and `length_of`.
+#
+# Values are described with `Dict{String,Any}` (the JSON-RPC wire shape), see
+# the schema in jet.ark's `resources/positron-comms/variables*.json`.
+#
+# Calls into packages the user may have loaded after the kernel started
+# (Tables.jl, user `show` methods) rely on the caller running in the latest
+# world age; the comm entry points use `Base.invokelatest`.
+
+const MAX_DISPLAY = 500
+const MAX_CHILDREN = 500
+const ELLIPSIS = "…"
+
+"Values with no inspectable children."
+const Atomic = Union{
+    Number,
+    AbstractString,
+    Function,
+    Type,
+    Nothing,
+    Missing,
+    Symbol,
+    Module,
+}
+
+"Names in `Main` that are never user variables."
+const HIDDEN_NAMES = (:Base, :Core, :Main, :ans, :include, :eval, :In, :Out)
+
+#
+# Optional Tables.jl support (looked up, never imported)
+#
+
+const TABLES_ID = Base.PkgId(Base.UUID("bd369af6-aec1-5ad0-b16a-f7cc5008161c"), "Tables")
+
+"Return the already-loaded Tables.jl module, or `nothing`; never load it."
+tables_module() = get(Base.loaded_modules, TABLES_ID, nothing)
+
+"Test the loaded Tables.jl interface in the latest world age; return false on errors."
+function istable(x)
+    T = tables_module()
+    T === nothing && return false
+    try
+        return Base.invokelatest(T.istable, x)::Bool
+    catch
+        return false
+    end
+end
+
+"`(columns, names)` via loaded Tables.jl; requires a table and may propagate interface errors."
+function table_columns(x)
+    T = tables_module()
+    cols = Base.invokelatest(T.columns, x)
+    return cols, collect(Base.invokelatest(T.columnnames, cols))
+end
+
+"Read a named Tables.jl column in the latest world age; Tables.jl must be loaded."
+table_column(cols, name) = Base.invokelatest(tables_module().getcolumn, cols, name)
+
+"`(nrow, ncol)` if `x` is a table, otherwise `nothing`."
+function table_dims(x)
+    istable(x) || return nothing
+    try
+        cols, names = table_columns(x)
+        nrow = isempty(names) ? 0 : length(table_column(cols, first(names)))
+        return (nrow, length(names))
+    catch
+        return nothing
+    end
+end
+
+#
+# Display helpers
+#
+
+"Return at most `n` characters, including a trailing ellipsis when truncated (`n ≥ 1`)."
+ellipsize(s::AbstractString, n::Integer = MAX_DISPLAY) = length(s) > n ?
+    first(s, n - 1) * ELLIPSIS :
+    String(s)
+
+"Render with compact, limited `show`, cap at `MAX_DISPLAY` characters, and contain show errors."
+function compact_string(x)
+    io = IOBuffer()
+    try
+        show(IOContext(io, :compact => true, :limit => true), x)
+    catch
+        return "<error displaying value>"
+    end
+    return ellipsize(String(take!(io)))
+end
+
+#
+# Per-type behaviour
+#
+
+"""
+Classify `x` using the Positron kind vocabulary: one of `boolean`, `bytes`, `class`, `collection`,
+`empty`, `function`, `map`, `number`, `other`, `string`, `table`.
+"""
+kind(::Bool) = "boolean"
+kind(::Number) = "number"
+kind(::AbstractString) = "string"
+kind(::Function) = "function"
+kind(::AbstractDict) = "map"
+kind(::AbstractArray) = "collection"
+kind(::Union{Nothing, Missing}) = "empty"
+kind(::Type) = "class"
+kind(x) = istable(x) ? "table" : "other"
+
+"Short display text: table dimensions or bounded compact `show`; strings are quoted."
+function display_value(x)
+    dims = table_dims(x)
+    dims === nothing || return "[$(dims[1]) rows x $(dims[2]) columns] $(nameof(typeof(x)))"
+    return compact_string(x)
+end
+display_value(x::AbstractArray) = compact_string(x)
+display_value(x::AbstractDict) = compact_string(x)
+function display_value(x::AbstractString)
+    # `show` prints the whole string, so cut very long ones first.
+    limit = 4 * MAX_DISPLAY
+    shown = ncodeunits(x) > limit ? SubString(x, 1, thisind(x, limit)) : x
+    return ellipsize(repr(shown))
+end
+
+# The type column is narrow, so types are shown compactly: the type's name
+# (with parameters if short), then the shape in brackets: `Vector{Int64} [3]`,
+# `Matrix{Float64} [3, 4]`, `DataFrame [10, 3]`. The full type is in `type_info`.
+
+const MAX_TYPE_LABEL = 30
+
+"The type of `x`, without parameters if they would make it long."
+function type_label(x)
+    T = typeof(x)
+    s = string(T)
+    return length(s) <= MAX_TYPE_LABEL ? s : string(nameof(T))
+end
+
+"Format dimensions as a bracketed, comma-separated shape."
+shape_label(dims) = "[" * join(dims, ", ") * "]"
+
+"`Name [rows, cols]` for tables, otherwise `nothing`."
+function table_label(x)
+    dims = table_dims(x)
+    return dims === nothing ? nothing : "$(nameof(typeof(x))) $(shape_label(dims))"
+end
+
+"Compact type label with collection/table shape where available; not the full `type_info`."
+display_type(x) = something(table_label(x), type_label(x))
+display_type(::Function) = "Function"
+display_type(x::AbstractDict) = "$(type_label(x)) $(shape_label((length(x),)))"
+display_type(x::Union{Tuple, NamedTuple}) = something(
+    table_label(x),
+    "$(type_label(x)) $(shape_label((length(x),)))",
+)
+function display_type(x::AbstractArray)
+    return ndims(x) == 0 ? type_label(x) : "$(type_label(x)) $(shape_label(size(x)))"
+end
+
+"The number of elements: rows for tables, the first dimension for arrays."
+function length_of(x)
+    dims = table_dims(x)
+    dims === nothing || return dims[1]
+    try
+        return Int(length(x))
+    catch
+        return 0
+    end
+end
+length_of(x::AbstractArray) = ndims(x) == 0 ? 0 : size(x, 1)
+
+"The total number of children `x` has (`children` returns at most `MAX_CHILDREN`)."
+function n_children(x)
+    dims = table_dims(x)
+    dims === nothing || return dims[2]
+    return fieldcount(typeof(x))
+end
+n_children(::Atomic) = 0
+n_children(x::AbstractDict) = length(x)
+n_children(x::AbstractArray) = ndims(x) == 0 ? 0 : size(x, 1)
+
+"Up to `MAX_CHILDREN` key/value pairs: columns, dictionary entries, first-axis slices or defined fields."
+function children(x)
+    out = Pair{String, Any}[]
+    if istable(x)
+        cols, names = table_columns(x)
+        for name in Iterators.take(names, MAX_CHILDREN)
+            push!(out, string(name) => table_column(cols, name))
+        end
+        return out
+    end
+    for f in Iterators.take(fieldnames(typeof(x)), MAX_CHILDREN)
+        isdefined(x, f) && push!(out, string(f) => getfield(x, f))
+    end
+    return out
+end
+children(::Atomic) = Pair{String, Any}[]
+children(x::AbstractDict) = [string(k) => v for (k, v) in Iterators.take(x, MAX_CHILDREN)]
+function children(x::AbstractArray)
+    ndims(x) == 0 && return Pair{String, Any}[]
+    return [index_key(i) => element(x, i) for i in Iterators.take(axes(x, 1), MAX_CHILDREN)]
+end
+
+"""
+Resolve a child access key: column/field name, stringified dictionary key or
+bracketed first-axis array index. Missing keys throw `KeyError`; malformed
+array indices can throw parsing errors, and undefined fields can throw
+`UndefRefError`. Stringified dictionary-key collisions select the first match.
+"""
+function child(x, key::AbstractString)
+    if istable(x)
+        cols, names = table_columns(x)
+        for name in names
+            string(name) == key && return table_column(cols, name)
+        end
+        throw(KeyError(key))
+    end
+    for f in fieldnames(typeof(x))
+        string(f) == key && return getfield(x, f)
+    end
+    throw(KeyError(key))
+end
+child(::Atomic, key::AbstractString) = throw(KeyError(key))
+function child(x::AbstractDict, key::AbstractString)
+    for (k, v) in x
+        string(k) == key && return v
+    end
+    throw(KeyError(key))
+end
+function child(x::AbstractArray, key::AbstractString)
+    i = parse_index(key)
+    i in axes(x, 1) || throw(KeyError(key))
+    return element(x, i)
+end
+
+"Encode a first-axis array index as an access key such as `[2]`."
+index_key(i) = "[$i]"
+"Parse an integer access key, accepting optional surrounding brackets; malformed keys throw."
+parse_index(key::AbstractString) = parse(Int, strip(key, ['[', ']']))
+
+"Element `i` along the first dimension; a slice for higher-dimensional arrays."
+element(x::AbstractArray, i) = ndims(x) == 1 ? x[i] : selectdim(x, 1, i)
+
+"Approximate the reachable size with `Base.summarysize`, or zero if sizing fails."
+function byte_size(x)
+    try
+        return Int(Base.summarysize(x))
+    catch
+        return 0
+    end
+end
+
+#
+# Variables on the wire
+#
+
+"Current Unix time rounded to integer milliseconds for `updated_time`."
+now_ms() = round(Int, time() * 1000)
+
+"Describe `value`, stored under `key`, as a `Variable` message."
+function variable(key::AbstractString, value; time::Integer = now_ms())
+    display = display_value(value)
+    return Dict{String, Any}(
+        "access_key" => String(key),
+        "display_name" => String(key),
+        "display_value" => display,
+        "display_type" => display_type(value),
+        "type_info" => string(typeof(value)),
+        "size" => byte_size(value),
+        "kind" => kind(value),
+        "length" => length_of(value),
+        "has_children" => n_children(value) > 0,
+        # Data viewing is not provided by this comm; see `:JuliaView`.
+        "has_viewer" => false,
+        "is_truncated" => endswith(display, ELLIPSIS),
+        "updated_time" => time,
+    )
+end
+
+#
+# Globals
+#
+
+"Whether a defined, nondeprecated binding is a user variable (not internal, reserved or a module)."
+function is_visible(mod::Module, name::Symbol)
+    s = String(name)
+    (startswith(s, "#") || startswith(s, "_")) && return false
+    name in HIDDEN_NAMES && return false
+    isdefined(mod, name) || return false
+    Base.isdeprecated(mod, name) && return false
+    return !(getglobal(mod, name) isa Module)
+end
+
+# `names(Main)` lists the globals defined at the REPL; other modules need
+# `all = true` to list non-exported names too.
+"Sorted visible bindings; inspect nonexported names outside `Main` too."
+visible_names(mod::Module = Main) = sort!(filter(
+    n -> is_visible(mod, n),
+    names(mod; all = mod !== Main),
+))
+
+"Visible globals as `Variable` messages with one shared timestamp; skip inspection failures."
+function collect_variables(mod::Module = Main)
+    time = now_ms()
+    out = Dict{String, Any}[]
+    for name in visible_names(mod)
+        try
+            push!(out, variable(string(name), getglobal(mod, name); time))
+        catch
+            # Skip variables that cannot be inspected.
+        end
+    end
+    return out
+end
+
+"""
+Resolve an access-key `path` (a global name, then child keys) to a value.
+An empty path throws `ArgumentError`; a missing global or child throws
+`KeyError`. Child lookup can also propagate parsing or undefined-field errors.
+Does not evaluate Julia expressions.
+"""
+function resolve(path::AbstractVector{<:AbstractString}, mod::Module = Main)
+    isempty(path) && throw(ArgumentError("empty path"))
+    name = Symbol(first(path))
+    isdefined(mod, name) || throw(KeyError(first(path)))
+    value = getglobal(mod, name)
+    for key in path[(begin + 1):end]
+        value = child(value, key)
+    end
+    return value
+end
+
+"`(children, total)` wire values with a shared timestamp; children are capped, total is not."
+function inspect(value; time::Integer = now_ms())
+    kids = [variable(key, v; time) for (key, v) in children(value)]
+    return kids, n_children(value)
+end
+
+#
+# Change detection: a cheap fingerprint per variable, so that only changed
+# variables are described in full after each execution.
+#
+
+# The fingerprint never calls `show` or `summarysize` and never touches the
+# elements of a collection, so its cost is independent of the user's types and
+# of how large the values are:
+#
+#   * small isbits values (numbers, small tuples): the value itself
+#   * short strings: their hash; long strings: identity and length
+#   * arrays, dictionaries, sets: identity plus size/length
+#   * tables (when Tables.jl is loaded): identity plus rows x columns
+#   * everything else: identity (`objectid`)
+#
+# Detected: reassignment, a change of type, `push!`/`resize!`/`delete!` and
+# other changes of size, added or removed table columns or rows.
+# Missed: in-place changes that keep the size (`x[1] = 5`, `d[:k] = v` for an
+# existing key, `df[1, :a] = 1`, mutating a field of a struct); these show up
+# on the next reassignment or manual refresh.
+
+const MAX_HASHED_BYTES = 64
+const MAX_HASHED_STRING = 4096
+
+fingerprint_of(x::AbstractArray) = (typeof(x), objectid(x), size(x))
+fingerprint_of(x::Union{AbstractDict, AbstractSet}) = (typeof(x), objectid(x), length(x))
+function fingerprint_of(x::AbstractString)
+    return ncodeunits(x) <= MAX_HASHED_STRING ?
+        (typeof(x), hash(x)) :
+        (typeof(x), objectid(x), ncodeunits(x))
+end
+function fingerprint_of(x)
+    T = typeof(x)
+    isbitstype(T) && sizeof(x) <= MAX_HASHED_BYTES && return (T, x)
+    return (T, objectid(x), ismutable(x) ? table_dims(x) : nothing)
+end
+
+"Cheap change fingerprint of a value; see the notes above for what it can and cannot detect."
+function fingerprint(x)
+    try
+        return fingerprint_of(x)
+    catch
+        return (Nothing, 0, nothing)
+    end
+end
+
+"Map visible global names to fingerprints, skipping bindings that cannot be read."
+function snapshot(mod::Module = Main)
+    out = Dict{String, Any}()
+    for name in visible_names(mod)
+        try
+            out[string(name)] = fingerprint(getglobal(mod, name))
+        catch
+        end
+    end
+    return out
+end
+
+"`(changed, removed)` names between two snapshots."
+function diff(old::AbstractDict, new::AbstractDict)
+    changed = sort!([k for (k, fp) in new if !isequal(get(old, k, nothing), fp)])
+    removed = sort!([k for k in keys(old) if !haskey(new, k)])
+    return changed, removed
+end
+
+@testitem "kind covers the basic types" begin
+    @test REPLConnect.kind(true) == "boolean"
+    @test REPLConnect.kind(1) == "number"
+    @test REPLConnect.kind(1.5) == "number"
+    @test REPLConnect.kind("a") == "string"
+    @test REPLConnect.kind(sin) == "function"
+    @test REPLConnect.kind(Dict(1 => 2)) == "map"
+    @test REPLConnect.kind([1, 2]) == "collection"
+    @test REPLConnect.kind(nothing) == "empty"
+    @test REPLConnect.kind(missing) == "empty"
+    @test REPLConnect.kind(Int) == "class"
+    @test REPLConnect.kind((1, 2)) == "other"
+end
+
+@testitem "display_value is bounded and single-valued" begin
+    @test REPLConnect.display_value(1) == "1"
+    @test REPLConnect.display_value("hi") == "\"hi\""
+    long = REPLConnect.display_value("x"^10_000)
+    @test length(long) == REPLConnect.MAX_DISPLAY
+    @test endswith(long, "…")
+    @test REPLConnect.display_value("α"^10_000) |> length == REPLConnect.MAX_DISPLAY
+    @test REPLConnect.display_value(1:5) == "1:5"
+end
+
+@testitem "display_type is compact and shows the shape" begin
+    @test REPLConnect.display_type(1) == "Int64"
+    @test REPLConnect.display_type("s") == "String"
+    @test REPLConnect.display_type(sin) == "Function"
+    @test REPLConnect.display_type(Int) == "DataType"
+    @test REPLConnect.display_type([1, 2, 3]) == "Vector{Int64} [3]"
+    @test REPLConnect.display_type(ones(3, 4)) == "Matrix{Float64} [3, 4]"
+    @test REPLConnect.display_type(Int[]) == "Vector{Int64} [0]"
+    @test REPLConnect.display_type(fill(1)) == "Array{Int64, 0}"
+    @test REPLConnect.display_type(Dict(:a => 1)) == "Dict{Symbol, Int64} [1]"
+    @test REPLConnect.display_type((1, 2)) == "Tuple{Int64, Int64} [2]"
+
+    # Long parameter lists fall back to the bare name
+    @test REPLConnect.display_type((x = 30, a = "testing")) == "NamedTuple [2]"
+    long = Dict("a" => (1, 2, 3))
+    @test REPLConnect.display_type(long) == "Dict [1]"
+
+    # The full type is still available
+    @test REPLConnect.variable("q", (x = 30, a = "testing"))["type_info"] ==
+        "@NamedTuple{x::Int64, a::String}"
+end
+
+@testitem "length_of and n_children" begin
+    @test REPLConnect.length_of([1, 2, 3]) == 3
+    @test REPLConnect.length_of(ones(4, 2)) == 4
+    @test REPLConnect.length_of(fill(1)) == 0
+    @test REPLConnect.length_of(Dict(1 => 2, 3 => 4)) == 2
+    @test REPLConnect.n_children(1) == 0
+    @test REPLConnect.n_children("abc") == 0
+    @test REPLConnect.n_children(sin) == 0
+    @test REPLConnect.n_children(Int[]) == 0
+    @test REPLConnect.n_children([1, 2]) == 2
+    @test REPLConnect.n_children(Dict(1 => 2)) == 1
+    @test REPLConnect.n_children((a = 1, b = 2)) == 2
+end
+
+@testitem "children and child agree for collections" begin
+    arr = [10, 20, 30]
+    @test REPLConnect.children(arr) == ["[1]" => 10, "[2]" => 20, "[3]" => 30]
+    @test REPLConnect.child(arr, "[2]") == 20
+    @test_throws KeyError REPLConnect.child(arr, "[4]")
+
+    mat = [1 2; 3 4]
+    @test REPLConnect.child(mat, "[2]") == [3, 4]
+
+    dict = Dict(:a => 1, "b" => 2)
+    @test Dict(REPLConnect.children(dict)) == Dict("a" => 1, "b" => 2)
+    @test REPLConnect.child(dict, "a") == 1
+    @test_throws KeyError REPLConnect.child(dict, "z")
+
+    nt = (x = 1, y = "two")
+    @test REPLConnect.children(nt) == ["x" => 1, "y" => "two"]
+    @test REPLConnect.child(nt, "y") == "two"
+    @test_throws KeyError REPLConnect.child(1, "x")
+end
+
+@testitem "children are capped but the total is reported" begin
+    big = collect(1:(REPLConnect.MAX_CHILDREN + 10))
+    kids, total = REPLConnect.inspect(big)
+    @test length(kids) == REPLConnect.MAX_CHILDREN
+    @test total == length(big)
+end
+
+@testitem "tables are recognised once Tables.jl is loaded" begin
+    using Tables
+    t = (a = [1, 2, 3], b = ["x", "y", "z"])
+    @test REPLConnect.kind(t) == "table"
+    @test REPLConnect.display_value(t) == "[3 rows x 2 columns] NamedTuple"
+    @test REPLConnect.display_type(t) == "NamedTuple [3, 2]"
+    @test REPLConnect.length_of(t) == 3
+    @test REPLConnect.n_children(t) == 2
+    @test REPLConnect.children(t) == ["a" => [1, 2, 3], "b" => ["x", "y", "z"]]
+    @test REPLConnect.child(t, "b") == ["x", "y", "z"]
+    @test_throws KeyError REPLConnect.child(t, "c")
+end
+
+@testitem "variable describes a value" begin
+    v = REPLConnect.variable("xs", [1, 2, 3]; time = 7)
+    @test v["access_key"] == "xs"
+    @test v["display_name"] == "xs"
+    @test v["display_value"] == "[1, 2, 3]"
+    @test v["display_type"] == "Vector{Int64} [3]"
+    @test v["type_info"] == "Vector{Int64}"
+    @test v["kind"] == "collection"
+    @test v["length"] == 3
+    @test v["has_children"] === true
+    @test v["has_viewer"] === false
+    @test v["is_truncated"] === false
+    @test v["updated_time"] == 7
+    @test v["size"] > 0
+
+    @test REPLConnect.variable("n", 1)["has_children"] === false
+    @test REPLConnect.variable("s", "x"^10_000)["is_truncated"] === true
+end
+
+@testitem "globals are listed and resolved" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(x = 1))
+    Core.eval(sandbox, :(_hidden = 2))
+    Core.eval(sandbox, :(f(a) = a))
+    Core.eval(sandbox, :(nt = (p = [1, 2], q = "s")))
+    Core.eval(sandbox, :(ans = 3))
+
+    @test REPLConnect.visible_names(sandbox) == [:f, :nt, :x]
+    @test sort!([v["access_key"] for v in REPLConnect.collect_variables(sandbox)]) ==
+        ["f", "nt", "x"]
+
+    @test REPLConnect.resolve(["x"], sandbox) == 1
+    @test REPLConnect.resolve(["nt", "p"], sandbox) == [1, 2]
+    @test REPLConnect.resolve(["nt", "p", "[2]"], sandbox) == 2
+    @test_throws KeyError REPLConnect.resolve(["missing"], sandbox)
+    @test_throws KeyError REPLConnect.resolve(["nt", "zzz"], sandbox)
+    @test_throws ArgumentError REPLConnect.resolve(String[], sandbox)
+end
+
+@testitem "nothing-valued children can be resolved" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(d = $(Dict("k" => nothing))))
+    @test REPLConnect.resolve(["d", "k"], sandbox) === nothing
+end
+
+@testitem "modules are not listed as variables" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(m = $Base))
+    @test isempty(REPLConnect.visible_names(sandbox))
+end
+
+@testitem "diff reports changed and removed variables" begin
+    sandbox = Module(:Sandbox, false)
+    Core.eval(sandbox, :(a = 1))
+    Core.eval(sandbox, :(b = [1, 2]))
+    before = REPLConnect.snapshot(sandbox)
+
+    @test REPLConnect.diff(before, REPLConnect.snapshot(sandbox)) == (String[], String[])
+
+    Core.eval(sandbox, :(a = 2))
+    Core.eval(sandbox, :(c = "new"))
+    push!(Core.eval(sandbox, :b), 3) # mutated in place
+    after = REPLConnect.snapshot(sandbox)
+    @test REPLConnect.diff(before, after) == (["a", "b", "c"], String[])
+
+    Base.delete_binding(sandbox, :a)
+    @test REPLConnect.diff(after, REPLConnect.snapshot(sandbox)) == (String[], ["a"])
+end
+
+@testitem "the fingerprint detects what it promises and never calls show" begin
+    shown = Ref(0)
+    struct Loud
+        n::Int
+    end
+    Base.show(io::IO, x::Loud) = (shown[] += 1; print(io, "Loud"))
+    Base.length(::Loud) = (shown[] += 1; 1)
+    Base.summarysize(::Loud) = (shown[] += 1; 8)
+    mutable struct LoudBox
+        v::Int
+    end
+    Base.show(io::IO, ::LoudBox) = (shown[] += 1; print(io, "LoudBox"))
+
+    fp = REPLConnect.fingerprint
+    changed(a, b) = !isequal(fp(a), fp(b))
+
+    # values: reassignment and type changes
+    @test changed(1, 2)
+    @test !changed(1, 1)
+    @test changed(1, 1.0)
+    @test changed("a", "b")
+    @test !changed("a", "a")
+    @test changed((1, 2), (1, 3))
+    @test !changed(NaN, NaN)
+    @test changed("x"^10_000, "y"^10_000) # long strings: identity and length
+
+    # collections: identity and size
+    v = [1, 2, 3]
+    before = fp(v)
+    @test isequal(before, fp(v))
+    push!(v, 4)
+    @test !isequal(before, fp(v))
+    @test changed([1, 2], [1, 2]) # a new array is a change
+    d = Dict(:a => 1)
+    before = fp(d)
+    d[:b] = 2
+    @test !isequal(before, fp(d))
+    s = Set([1])
+    before = fp(s)
+    push!(s, 2)
+    @test !isequal(before, fp(s))
+    m = zeros(2, 2)
+    before = fp(m)
+    @test !isequal(before, fp(zeros(2, 3)))
+
+    # documented limit: same-size in-place changes are not seen
+    v = [1, 2, 3]
+    before = fp(v)
+    v[1] = 99
+    @test isequal(before, fp(v))
+
+    # user types: no `show`, `length` or `summarysize`, whatever they do
+    loud = Loud(1)
+    box = LoudBox(1)
+    fp(loud)
+    fp(box)
+    @test changed(Loud(1), Loud(2))
+    @test changed(LoudBox(1), LoudBox(1)) # distinct objects
+    @test shown[] == 0
+
+    # failures never escape
+    mutable struct Fragile end
+    Base.objectid(::Fragile) = error("boom")
+    @test fp(Fragile()) isa Tuple
+end
+
+@testitem "the fingerprint sees table shape changes when Tables.jl is loaded" begin
+    using DataFrames
+    df = DataFrame(a = 1:3)
+    before = REPLConnect.fingerprint(df)
+    df.b = 4:6
+    @test !isequal(before, REPLConnect.fingerprint(df))
+    before = REPLConnect.fingerprint(df)
+    push!(df, (4, 7))
+    @test !isequal(before, REPLConnect.fingerprint(df))
+end
