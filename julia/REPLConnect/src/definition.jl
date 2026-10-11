@@ -57,7 +57,9 @@ end
 function repl_source(file::AbstractString, line::Integer)
     input = get(REPL_DEFINITIONS, file, nothing)
     input === nothing && return nothing
-    return something(history_text(input), statement_text(input, line), Some(nothing))
+    text = history_text(input)
+    text === nothing || return expression_at(split(text, '\n'), line)
+    return statement_text(input, line)
 end
 
 "The CodeTracking definition of `m` (present when Revise is loaded), or `nothing`."
@@ -76,20 +78,29 @@ end
 function file_source(path, line::Integer)
     path === nothing && return nothing
     return try
-        lines = readlines(path)
-        line <= length(lines) || return nothing
-        text = join(lines[line:end], "\n")
-        _, stop = Meta.parse(text, 1; raise = false)
-        rstrip(text[1:prevind(text, stop)])
+        expression_at(readlines(path), line)
     catch
         nothing
     end
 end
 
+"Text of the one top-level expression starting at `line` of `lines`, or `nothing`."
+function expression_at(lines, line::Integer)
+    1 <= line <= length(lines) || return nothing
+    text = join(lines[line:end], "\n")
+    _, stop = Meta.parse(text, 1; raise = false)
+    return String(rstrip(text[1:prevind(text, stop)]))
+end
+
+# Prompt inputs are looked up first: CodeTracking indexes the REPL history in a
+# way that is wrong on Julia 1.13, giving every method the same input.
 function method_source(m::Method, path, file::AbstractString, line::Integer)
+    if startswith(file, "REPL[")
+        src = repl_source(file, line)
+        src === nothing || return src
+    end
     src = codetracking_source(m)
     src === nothing || return src
-    startswith(file, "REPL[") && return repl_source(file, line)
     return file_source(path, line)
 end
 
@@ -184,6 +195,29 @@ end
     @test loc["file"] == "REPL[7]"
     @test !isfile(loc["file"])
     @test loc["source"] == "answer(x, y) = x + y"
+end
+
+@testitem "each method sent in one prompt input gets its own source" begin
+    sandbox = Module(:Sandbox, false)
+    input = Meta.parseall("#%%\nduo(x, y) = x + y\n\nduo(x) = 20x"; filename = "REPL[8]")
+    REPLConnect.remember_definition!(input)
+    Core.eval(sandbox, input)
+    service = REPLConnect.Service("c", sandbox)
+
+    reply = REPLConnect.respond(
+        service,
+        Dict("id" => 1, "method" => "definition", "params" => Dict("path" => ["duo"])),
+    )
+    sources = Dict(l["line"] => l["source"] for l in reply["result"]["locations"])
+    @test sources[2] == "duo(x, y) = x + y"
+    @test occursin("duo(x) =", sources[4])
+end
+
+@testitem "expression_at cuts one statement out of multi-statement text" begin
+    lines = ["#%%", "function f(x)", "    x", "end", "", "g(x) = 1"]
+    @test REPLConnect.expression_at(lines, 2) == "function f(x)\n    x\nend"
+    @test REPLConnect.expression_at(lines, 6) == "g(x) = 1"
+    @test REPLConnect.expression_at(lines, 7) === nothing
 end
 
 @testitem "definition is a capability" begin
