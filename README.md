@@ -50,6 +50,33 @@ installed `REPLConnect` package if there is one, and otherwise load the source
 from this plugin checkout. The Install and Setup steps below are therefore only
 needed to connect to a REPL you start yourself in a terminal.
 
+### Completion (blink.cmp / nvim-cmp)
+
+Runtime completions come through a normal LSP client, so the default `lsp`
+source picks them up with no extra configuration. The client already
+advertises `.`, `[`, `"` and `:` as trigger characters, so you do **not** need
+to override `get_trigger_characters` for Julia.
+
+Optionally, rank REPLConnect items above other language servers in blink.cmp:
+
+```lua
+sources = {
+  providers = {
+    lsp = {
+      transform_items = function(_, items)
+        for _, item in ipairs(items) do
+          local client = vim.lsp.get_client_by_id(item.client_id)
+          if client and client.name:match '^replconnect' then
+            item.score_offset = (item.score_offset or 0) + 100
+          end
+        end
+        return items
+      end,
+    },
+  },
+},
+```
+
 ## Setup
 
 Add this to your `~/.julia/config/startup.jl`
