@@ -1,8 +1,10 @@
 # `definition`: where and how each method of a function is defined.
 # Read-only: no evaluation and no package loading.
 
-const CODETRACKING =
-    Base.PkgId(Base.UUID("da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"), "CodeTracking")
+const CODETRACKING = Base.PkgId(
+    Base.UUID("da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"),
+    "CodeTracking",
+)
 
 "Most methods returned for one function; methods from `Main` come first."
 const DEFINITION_LIMIT = 200
@@ -11,11 +13,12 @@ const DEFINITION_LIMIT = 200
 const REPL_DEFINITIONS = Dict{String, Any}()
 
 "Whether `ex` contains a method definition (`function`, `f(x) = …`, long or short form)."
-defines_method(ex) = ex isa Expr && (
-    ex.head === :function ||
-        (ex.head === :(=) && is_signature(ex.args[1])) ||
-        any(defines_method, ex.args)
-)
+defines_method(ex) = ex isa Expr &&
+    (
+        ex.head === :function ||
+            (ex.head === :(=) && is_signature(ex.args[1])) ||
+            any(defines_method, ex.args)
+    )
 is_signature(lhs) = lhs isa Expr &&
     (lhs.head === :call || (lhs.head in (:where, :(::)) && is_signature(lhs.args[1])))
 
@@ -47,7 +50,9 @@ end
 function statement_text(input, line::Integer)
     args = input.args
     for (i, arg) in enumerate(args)
-        arg isa LineNumberNode && arg.line == line && i < length(args) &&
+        arg isa LineNumberNode &&
+            arg.line == line &&
+            i < length(args) &&
             return string(strip_markers(args[i + 1]))
     end
     return nothing
@@ -126,12 +131,14 @@ function definition_methods(f)
     return first(ms, DEFINITION_LIMIT)
 end
 
-definition_locations(f) = Dict{String, Any}[method_location(m) for m in definition_methods(f)]
+definition_locations(f) = Dict{String, Any}[
+    method_location(m)
+    for m in definition_methods(f)
+]
 
 function handle_request(service::Service, ::Val{:definition}, params)
     f = resolve(path_param(params), service.mod)
-    f isa Union{Function, Type} ||
-        throw(RpcError(INVALID_PARAMS, "Not a function"))
+    f isa Union{Function, Type} || throw(RpcError(INVALID_PARAMS, "Not a function"))
     return Dict{String, Any}("locations" => definition_locations(f))
 end
 
