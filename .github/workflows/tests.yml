@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  julia:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12"
+      - uses: julia-actions/cache@v2
+      - name: Run test items
+        shell: julia --color=yes {0}
+        run: |
+          using Pkg
+          Pkg.activate(; temp = true)
+          Pkg.develop(path = "julia/REPLConnect")
+          Pkg.add(["TestItemRunner", "Test", "Chairmarks", "DataFrames", "Tables"])
+          using TestItemRunner
+          run_tests("julia/REPLConnect")
+
+  nvim:
+    name: Neovim plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: arnold-c/REPLConnect.nvim
+          path: REPLConnect.nvim
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+      - name: Run Neovim tests
+        env:
+          REPLCONNECT_CORE: ${{ github.workspace }}/REPLConnect.nvim
+        run: nvim --headless -u NONE -l tests/launch.lua

@@ -1,0 +1,17 @@
+name: Fatou
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fatou:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jolars/fatou-action@v1
+        with:
+          path: julia/
