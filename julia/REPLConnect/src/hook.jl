@@ -78,5 +78,5 @@ end
     @test count(==(REPLConnect.mark_transform), REPL.repl_ast_transforms) == 1
     REPLConnect.uninstall_hook!()
     @test REPLConnect.mark_transform ∉ REPL.repl_ast_transforms
-    @test REPLConnect.busy() == false
+    @test !REPLConnect.busy()
 end

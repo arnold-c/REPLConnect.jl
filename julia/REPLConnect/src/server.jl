@@ -354,7 +354,7 @@ end
         @test init["result"]["pid"] == getpid()
 
         status = ask(Dict("id" => 2, "method" => "status"))["result"]
-        @test status["busy"] == false
+        @test !status["busy"]
         @test status["version"] == REPLConnect.version()
 
         list = ask(Dict("id" => 3, "method" => "list"))["result"]
